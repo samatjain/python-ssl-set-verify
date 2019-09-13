@@ -712,6 +712,14 @@ _ssl__SSLContext_cert_store_stats(PySSLContext *self, PyObject *Py_UNUSED(ignore
     return _ssl__SSLContext_cert_store_stats_impl(self);
 }
 
+PyDoc_STRVAR(_ssl__SSLContext_set_verify_callback__doc__,
+"set_verify_callback($self, name, /)\n"
+"--\n"
+"\n");
+
+#define _SSL__SSLCONTEXT_SET_VERIFY_CALLBACK_METHODDEF \
+    {"set_verify_callback", (PyCFunction)_ssl__SSLContext_set_verify_callback, METH_O, _ssl__SSLContext_set_verify_callback__doc__},
+
 PyDoc_STRVAR(_ssl__SSLContext_get_ca_certs__doc__,
 "get_ca_certs($self, /, binary_form=False)\n"
 "--\n"
@@ -1181,6 +1189,10 @@ exit:
 #ifndef _SSL__SSLCONTEXT_SET_ECDH_CURVE_METHODDEF
     #define _SSL__SSLCONTEXT_SET_ECDH_CURVE_METHODDEF
 #endif /* !defined(_SSL__SSLCONTEXT_SET_ECDH_CURVE_METHODDEF) */
+
+#ifndef _SSL__SSLCONTEXT_SET_VERIFY_CALLBACK_METHODDEF
+    #define _SSL__SSLCONTEXT_SET_VERIFY_CALLBACK_METHODDEF
+#endif /* !defined(_SSL__SSLCONTEXT_SET_VERIFY_CALLBACK_METHODDEF) */
 
 #ifndef _SSL_RAND_EGD_METHODDEF
     #define _SSL_RAND_EGD_METHODDEF
