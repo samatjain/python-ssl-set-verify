@@ -324,6 +324,7 @@ typedef struct {
     PyObject *set_hostname;
 #endif
     int check_hostname;
+    PyObject *set_verify;
 } PySSLContext;
 
 typedef struct {
@@ -1415,6 +1416,24 @@ _decode_certificate(X509 *certificate) {
         }
     }
 
+    X509_check_ca(certificate);
+    obj = PyInt_FromLong(certificate->ex_pathlen);
+    result = PyDict_SetItemString(retval, "basicConstraints", obj);
+    Py_DECREF(obj);
+    if (result < 0)
+        goto fail1;
+
+    obj = PyInt_FromLong(certificate->ex_xkusage);
+    result = PyDict_SetItemString(retval, "extendedKeyUsage", obj);
+    Py_DECREF(obj);
+    if (result < 0)
+        goto fail1;
+
+    obj = PyInt_FromLong(certificate->ex_flags);
+    result = PyDict_SetItemString(retval, "ex_flags", obj);
+    Py_DECREF(obj);
+    if (result < 0)
+        goto fail1;
     BIO_free(biobuf);
     return retval;
 
@@ -2239,6 +2258,7 @@ context_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 #endif
     /* Don't check host name by default */
     self->check_hostname = 0;
+    self->set_verify = NULL;
     /* Defaults */
     SSL_CTX_set_verify(self->ctx, SSL_VERIFY_NONE, NULL);
     options = SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS;
@@ -2317,6 +2337,7 @@ context_traverse(PySSLContext *self, visitproc visit, void *arg)
 #ifndef OPENSSL_NO_TLSEXT
     Py_VISIT(self->set_hostname);
 #endif
+    Py_VISIT(self->set_verify);
     return 0;
 }
 
@@ -2326,6 +2347,7 @@ context_clear(PySSLContext *self)
 #ifndef OPENSSL_NO_TLSEXT
     Py_CLEAR(self->set_hostname);
 #endif
+    Py_CLEAR(self->set_verify);
     return 0;
 }
 
@@ -2527,8 +2549,11 @@ static int
 set_verify_mode(PySSLContext *self, PyObject *arg, void *c)
 {
     int n, mode;
+    int (*verify_callback)(int, X509_STORE_CTX *);
+
     if (!PyArg_Parse(arg, "i", &n))
         return -1;
+
     if (n == PY_SSL_CERT_NONE)
         mode = SSL_VERIFY_NONE;
     else if (n == PY_SSL_CERT_OPTIONAL)
@@ -2540,13 +2565,17 @@ set_verify_mode(PySSLContext *self, PyObject *arg, void *c)
                         "invalid value for verify_mode");
         return -1;
     }
-    if (mode == SSL_VERIFY_NONE && self->check_hostname) {
+
+    if (mode == SSL_VERIFY_NONE &&
+            (self->check_hostname || PyCallable_Check(self->set_verify))) {
         PyErr_SetString(PyExc_ValueError,
                         "Cannot set verify_mode to CERT_NONE when "
-                        "check_hostname is enabled.");
+                        "check_hostname or verify_callback is enabled.");
         return -1;
     }
-    SSL_CTX_set_verify(self->ctx, mode, NULL);
+
+    verify_callback = SSL_CTX_get_verify_callback(self->ctx);
+    SSL_CTX_set_verify(self->ctx, mode, verify_callback);
     return 0;
 }
 
@@ -3242,6 +3271,78 @@ set_ecdh_curve(PySSLContext *self, PyObject *name)
 }
 #endif
 
+static int
+_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
+{
+    int ret = 0;
+    PySSLContext *ssl_ctx;
+    PySSLSocket *ssl;
+    PyObject *result;
+    PyObject *ssl_socket;
+    PyObject *cert;
+    X509* current_cert;
+    int depth, err;
+#ifdef WITH_THREAD
+    PyGILState_STATE gstate = PyGILState_Ensure();
+#endif
+
+    SSL* s = X509_STORE_CTX_get_ex_data(ctx,
+                                        SSL_get_ex_data_X509_STORE_CTX_idx());
+    ssl = SSL_get_app_data(s);
+    ssl_ctx = ssl->ctx;
+
+    if (ssl_ctx->set_verify == NULL) {
+#ifdef WITH_THREAD
+        PyGILState_Release(gstate);
+#endif
+        return ret;
+    }
+
+    assert(PySSLSocket_Check(ssl));
+    if (ssl->ssl_sock == NULL) {
+        ssl_socket = Py_None;
+        goto error;
+    } else {
+        ssl_socket = PyWeakref_GetObject(ssl->ssl_sock);
+        Py_INCREF(ssl_socket);
+    }
+
+    current_cert = X509_STORE_CTX_get_current_cert(ctx);
+    if (current_cert == NULL)
+        goto error;
+    err = X509_STORE_CTX_get_error(ctx);
+    depth = X509_STORE_CTX_get_error_depth(ctx);
+
+    cert = _decode_certificate(current_cert);
+    if (cert == NULL)
+        goto error;
+
+    result = PyObject_CallFunction(ssl_ctx->set_verify, "OiOii", ssl_socket,
+                                   preverify_ok, cert, err, depth, NULL);
+    Py_DECREF(ssl_socket);
+    Py_DECREF(cert);
+
+    if (result == NULL) {
+        PyErr_WriteUnraisable(ssl_ctx->set_verify);
+    } else {
+        ret = (result == Py_True);
+        Py_DECREF(result);
+    }
+
+#ifdef WITH_THREAD
+    PyGILState_Release(gstate);
+#endif
+    return ret;
+
+error:
+    Py_DECREF(ssl_socket);
+
+#ifdef WITH_THREAD
+    PyGILState_Release(gstate);
+#endif
+    return ret;
+}
+
 #if HAVE_SNI && !defined(OPENSSL_NO_TLSEXT)
 static int
 _servername_callback(SSL *s, int *al, void *args)
@@ -3382,6 +3483,53 @@ set_servername_callback(PySSLContext *self, PyObject *args)
                     "is not in the current OpenSSL library.");
     return NULL;
 #endif
+}
+
+PyDoc_STRVAR(PySSL_set_verify_callback_doc,
+"set_verify_callback(method)\n\
+\n\
+This sets the verification callback that will be called to control\n\
+the behavior when ssl.CERT_REQUIRED or ssl.CERT_OPTIONAL is set.\n\
+\n\
+If the callback is None then the callback is disabled. The method is called\n\
+on every certificate in the chain with the SSLSocket, preverify_ok indicating\n\
+whether the verification of the certificate in question was passed, a\n\
+dict instance of the certificate, potential error number, and depth.\n\
+\n\
+If the callback returns True, the verification process is continued,\n\
+otherwise the connection is terminated.");
+
+static PyObject *
+set_verify_callback(PySSLContext *self, PyObject *args)
+{
+    int mode;
+    PyObject *cb;
+    int (*verify_callback)(int, X509_STORE_CTX *) = _verify_callback;
+
+    if (!PyArg_ParseTuple(args, "O", &cb))
+        return NULL;
+
+    mode = SSL_CTX_get_verify_mode(self->ctx);
+    if (PyCallable_Check(cb)) {
+        if (mode == PY_SSL_CERT_NONE) {
+            PyErr_SetString(PyExc_ValueError,
+                        "cannot set a callback when verify_mode = CERT_NONE");
+            return NULL;
+        }
+        Py_CLEAR(self->set_verify);
+        Py_INCREF(cb);
+        self->set_verify = cb;
+    } else if (cb == Py_None) {
+        Py_CLEAR(self->set_verify);
+        verify_callback = NULL;
+    } else {
+        PyErr_SetString(PyExc_TypeError, "not a callable object");
+        return NULL;
+    }
+
+    SSL_CTX_set_verify(self->ctx, mode, verify_callback);
+
+    return Py_None;
 }
 
 PyDoc_STRVAR(PySSL_get_stats_doc,
@@ -3534,6 +3682,8 @@ static struct PyMethodDef context_methods[] = {
 #endif
     {"set_servername_callback", (PyCFunction) set_servername_callback,
                     METH_VARARGS, PySSL_set_servername_callback_doc},
+    {"set_verify_callback", (PyCFunction) set_verify_callback,
+                    METH_VARARGS, PySSL_set_verify_callback_doc},
     {"cert_store_stats", (PyCFunction) cert_store_stats,
                     METH_NOARGS, PySSL_get_stats_doc},
     {"get_ca_certs", (PyCFunction) get_ca_certs,
@@ -4308,6 +4458,55 @@ init_ssl(void)
                             X509_V_FLAG_CRL_CHECK|X509_V_FLAG_CRL_CHECK_ALL);
     PyModule_AddIntConstant(m, "VERIFY_X509_STRICT",
                             X509_V_FLAG_X509_STRICT);
+
+    /* X509_PURPOSE flags */
+    PyModule_AddIntConstant(m, "EXFLAG_BCONS", EXFLAG_BCONS);
+    PyModule_AddIntConstant(m, "EXFLAG_KUSAGE", EXFLAG_KUSAGE);
+    PyModule_AddIntConstant(m, "EXFLAG_XKUSAGE", EXFLAG_XKUSAGE);
+    PyModule_AddIntConstant(m, "EXFLAG_NSCERT", EXFLAG_NSCERT);
+
+    PyModule_AddIntConstant(m, "EXFLAG_CA", EXFLAG_CA);
+
+    PyModule_AddIntConstant(m, "EXFLAG_SI", EXFLAG_SI);
+    PyModule_AddIntConstant(m, "EXFLAG_V1", EXFLAG_V1);
+    PyModule_AddIntConstant(m, "EXFLAG_INVALID", EXFLAG_INVALID);
+    PyModule_AddIntConstant(m, "EXFLAG_SET", EXFLAG_SET);
+    PyModule_AddIntConstant(m, "EXFLAG_CRITICAL", EXFLAG_CRITICAL);
+    PyModule_AddIntConstant(m, "EXFLAG_PROXY", EXFLAG_PROXY);
+
+    PyModule_AddIntConstant(m, "EXFLAG_INVALID_POLICY", EXFLAG_INVALID_POLICY);
+    PyModule_AddIntConstant(m, "EXFLAG_FRESHEST", EXFLAG_FRESHEST);
+
+    PyModule_AddIntConstant(m, "EXFLAG_SS", EXFLAG_SS);
+
+    PyModule_AddIntConstant(m, "KU_DIGITAL_SIGNATURE", KU_DIGITAL_SIGNATURE);
+    PyModule_AddIntConstant(m, "KU_NON_REPUDIATION", KU_NON_REPUDIATION);
+    PyModule_AddIntConstant(m, "KU_KEY_ENCIPHERMENT", KU_KEY_ENCIPHERMENT);
+    PyModule_AddIntConstant(m, "KU_DATA_ENCIPHERMENT", KU_DATA_ENCIPHERMENT);
+    PyModule_AddIntConstant(m, "KU_KEY_AGREEMENT", KU_KEY_AGREEMENT);
+    PyModule_AddIntConstant(m, "KU_KEY_CERT_SIGN", KU_KEY_CERT_SIGN);
+    PyModule_AddIntConstant(m, "KU_CRL_SIGN", KU_CRL_SIGN);
+    PyModule_AddIntConstant(m, "KU_ENCIPHER_ONLY", KU_ENCIPHER_ONLY);
+    PyModule_AddIntConstant(m, "KU_DECIPHER_ONLY", KU_DECIPHER_ONLY);
+
+    PyModule_AddIntConstant(m, "NS_SSL_CLIENT", NS_SSL_CLIENT);
+    PyModule_AddIntConstant(m, "NS_SSL_SERVER", NS_SSL_SERVER);
+    PyModule_AddIntConstant(m, "NS_SMIME", NS_SMIME);
+    PyModule_AddIntConstant(m, "NS_OBJSIGN", NS_OBJSIGN);
+    PyModule_AddIntConstant(m, "NS_SSL_CA", NS_SSL_CA);
+    PyModule_AddIntConstant(m, "NS_SMIME_CA", NS_SMIME_CA);
+    PyModule_AddIntConstant(m, "NS_OBJSIGN_CA", NS_OBJSIGN_CA);
+    PyModule_AddIntConstant(m, "NS_ANY_CA", NS_ANY_CA);
+
+    PyModule_AddIntConstant(m, "XKU_SSL_SERVER", XKU_SSL_SERVER);
+    PyModule_AddIntConstant(m, "XKU_SSL_CLIENT", XKU_SSL_CLIENT);
+    PyModule_AddIntConstant(m, "XKU_SMIME", XKU_SMIME);
+    PyModule_AddIntConstant(m, "XKU_CODE_SIGN", XKU_CODE_SIGN);
+    PyModule_AddIntConstant(m, "XKU_SGC", XKU_SGC);
+    PyModule_AddIntConstant(m, "XKU_OCSP_SIGN", XKU_OCSP_SIGN);
+    PyModule_AddIntConstant(m, "XKU_TIMESTAMP", XKU_TIMESTAMP);
+    PyModule_AddIntConstant(m, "XKU_DVCS", XKU_DVCS);
+
 #ifdef X509_V_FLAG_TRUSTED_FIRST
     PyModule_AddIntConstant(m, "VERIFY_X509_TRUSTED_FIRST",
                             X509_V_FLAG_TRUSTED_FIRST);
